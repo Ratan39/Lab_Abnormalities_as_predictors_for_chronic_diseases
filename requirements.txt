@@ -1,3 +1,16 @@
+streamlit
 pandas
-pyarrow
 numpy
+scikit-learn
+matplotlib
+seaborn
+plotly
+pyarrow
+fastparquet
+joblib
+pydantic
+tqdm
+rich
+python-dotenv
+jupyter
+ipykernel
