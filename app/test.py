@@ -6,6 +6,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+SAMPLE_DATA_DIR = ROOT_DIR / "sample_data"
+
 import json
 from typing import Dict, Any, List, Optional
 
@@ -386,18 +388,85 @@ if page == "Upload":
 
     st.markdown("---")
 
+    # -----------------------------
+    # Option 2: Use a built-in sample patient
+    # -----------------------------
+    st.subheader("Method 1: Try a built-in sample patient")
+
+    if SAMPLE_DATA_DIR.exists():
+        sample_files = sorted(SAMPLE_DATA_DIR.glob("patient_*.json"))
+        if sample_files:
+            sample_labels = [f.name.replace(".json", "") for f in sample_files]
+            selected_label = st.selectbox(
+                "Choose a sample patient",
+                sample_labels,
+                help="These are example FHIR JSON files bundled with the app.",
+            )
+
+            # Map label back to path
+            selected_file = None
+            for f in sample_files:
+                if f.name.replace(".json", "") == selected_label:
+                    selected_file = f
+                    break
+
+            col_load, col_download = st.columns(2)
+
+            # Load sample directly into the app
+            with col_load:
+                if st.button("Load sample into app", use_container_width=True):
+                    try:
+                        with open(selected_file, "r") as f:
+                            bundle_json = json.load(f)
+                        st.session_state["bundle_json"] = bundle_json
+                        st.success(
+                            f"✅ Loaded **{selected_label}**. "
+                            "Use the sidebar to open **Report Analysis** and **Recommendations**."
+                        )
+                    except Exception as e:
+                        st.error(f"Could not read sample file: {e}")
+
+            # Offer the sample as a downloadable file
+            with col_download:
+                try:
+                    with open(selected_file, "r") as f:
+                        sample_content = f.read()
+                    st.download_button(
+                        label="Download sample JSON",
+                        data=sample_content,
+                        file_name=selected_file.name,
+                        mime="application/json",
+                        use_container_width=True,
+                    )
+                except Exception:
+                    st.write("")
+
+        else:
+            st.info("No sample patient files found in the `sample_data/` folder.")
+    else:
+        st.info("Sample data folder not found. Please create a `sample_data/` folder in the project root.")
+
+    st.markdown("---")
+
+    # -----------------------------
+    # Option 1: Upload your own file
+    # -----------------------------
+    st.subheader("Method 2: Upload your own FHIR JSON")
+
     uploaded_file = st.file_uploader("Upload your lab report (FHIR JSON)", type=["json"])
 
     if uploaded_file is not None:
         try:
             bundle_json = json.load(uploaded_file)
-            st.success(
-                "File uploaded successfully. Use the sidebar to open **Report Analysis** "
-                "and **Recommendations** for this report."
-            )
             st.session_state["bundle_json"] = bundle_json
+            st.success(
+                "✅ File uploaded successfully.\n\n"
+                "Use the sidebar to open **Report Analysis** and **Recommendations** for this report."
+            )
         except Exception as e:
             st.error(f"Could not read JSON: {e}")
+
+    st.markdown("---")
 
     st.stop()
 
