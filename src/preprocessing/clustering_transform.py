@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import List, Tuple
+import json
+import sys
 
 import joblib
 import numpy as np
 import pandas as pd
-import json
 
 
 # -----------------------------------------------------------
@@ -15,13 +16,13 @@ import json
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-CLUSTER_DIR = PROJECT_ROOT / "models" / "clustering"
+CLUSTER_DIR    = PROJECT_ROOT / "models" / "clustering"
 PREDICTION_DIR = PROJECT_ROOT / "models" / "prediction"
 
 IMPUTER_PATH = CLUSTER_DIR / "imputer.joblib"
-SCALER_PATH = CLUSTER_DIR / "scaler.joblib"
-PCA_PATH = CLUSTER_DIR / "pca_14components.joblib"
-KMEANS_PATH = CLUSTER_DIR / "kmeans_k4.joblib"
+SCALER_PATH  = CLUSTER_DIR / "scaler.joblib"
+PCA_PATH     = CLUSTER_DIR / "pca_14components.joblib"
+KMEANS_PATH  = CLUSTER_DIR / "kmeans_k4.joblib"
 
 FEATURE_COLS_PATH = PREDICTION_DIR / "feature_columns.json"
 
@@ -54,13 +55,35 @@ CLUSTER_FEATURE_COLUMNS: List[str] = [
 
 
 # -----------------------------------------------------------
-# Load imputer, scaler, PCA, KMeans, and model feature columns
+# Safe loader — clear error message if artifact is missing/stale
 # -----------------------------------------------------------
 
-imputer = joblib.load(IMPUTER_PATH)
-scaler = joblib.load(SCALER_PATH)
-pca = joblib.load(PCA_PATH)
-kmeans = joblib.load(KMEANS_PATH)
+def _load_artifact(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Artifact not found: {path}\n"
+            f"Run retrain_clustering_artifacts.py to regenerate it."
+        )
+    try:
+        return joblib.load(path)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load {path.name} — likely saved on a different "
+            f"Python/sklearn version (you are on Python "
+            f"{sys.version_info.major}.{sys.version_info.minor}).\n"
+            f"Run retrain_clustering_artifacts.py to fix this.\n"
+            f"Original error: {e}"
+        ) from e
+
+
+# -----------------------------------------------------------
+# Load artifacts at import time
+# -----------------------------------------------------------
+
+imputer = _load_artifact(IMPUTER_PATH)
+scaler  = _load_artifact(SCALER_PATH)
+pca     = _load_artifact(PCA_PATH)
+kmeans  = _load_artifact(KMEANS_PATH)
 
 with open(FEATURE_COLS_PATH, "r") as f:
     MODEL_FEATURE_COLUMNS: List[str] = json.load(f)
@@ -71,32 +94,16 @@ with open(FEATURE_COLS_PATH, "r") as f:
 # -----------------------------------------------------------
 
 def _prepare_features_for_clustering(feature_table: pd.DataFrame) -> pd.DataFrame:
-    """
-    Turn the feature_table (patient_id, age, sex, labs...) into
-    the numeric feature matrix used for imputer/scaler/PCA/KMeans.
-
-    We:
-      - drop patient_id
-      - encode sex as 0/1 if needed
-      - coerce numeric
-      - add any missing clustering columns as NaN
-      - reorder to CLUSTER_FEATURE_COLUMNS (exact training order)
-    """
-
     if feature_table.empty:
         raise ValueError("feature_table is empty; cannot compute cluster.")
 
     X = feature_table.copy()
 
-    # Drop patient_id if present
     if "patient_id" in X.columns:
         X = X.drop(columns=["patient_id"])
-
-    # Drop cluster if somehow present (shouldn't be yet)
     if "cluster" in X.columns:
         X = X.drop(columns=["cluster"])
 
-    # Encode sex if present as string
     if "sex" in X.columns and X["sex"].dtype == object:
         X["sex"] = (
             X["sex"].str.upper()
@@ -104,19 +111,14 @@ def _prepare_features_for_clustering(feature_table: pd.DataFrame) -> pd.DataFram
             .astype("float64")
         )
 
-    # Coerce all existing columns to numeric (non-numeric → NaN)
     for col in X.columns:
         X[col] = pd.to_numeric(X[col], errors="coerce")
 
-    # Ensure all clustering features exist (missing ones → NaN)
     for col in CLUSTER_FEATURE_COLUMNS:
         if col not in X.columns:
             X[col] = np.nan
 
-    # Reorder to EXACT same order as at training time
-    X = X[CLUSTER_FEATURE_COLUMNS].copy()
-
-    return X
+    return X[CLUSTER_FEATURE_COLUMNS].copy()
 
 
 # -----------------------------------------------------------
@@ -127,16 +129,6 @@ def add_cluster_and_align_for_models(
     feature_table: pd.DataFrame,
     model_feature_columns: List[str] | None = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Given:
-        feature_table: output of build_feature_table_for_bundle(...)
-                       (one row per patient, with patient_id, age, sex, labs...)
-
-    Returns:
-        feature_table_with_cluster: original table plus 'cluster' column
-        X_ready: DataFrame with columns in the exact order required by
-                 the XGBoost models (MODEL_FEATURE_COLUMNS), including 'cluster'.
-    """
 
     if model_feature_columns is None:
         model_feature_columns = MODEL_FEATURE_COLUMNS
@@ -144,25 +136,19 @@ def add_cluster_and_align_for_models(
     if feature_table.empty:
         raise ValueError("feature_table is empty; cannot prepare model input.")
 
-    # 1) Prepare matrix for clustering
-    X_cluster = _prepare_features_for_clustering(feature_table)
-
-    # 2) Apply imputer -> scaler -> PCA -> KMeans
-    X_imputed = imputer.transform(X_cluster)
-    X_scaled = scaler.transform(X_imputed)
-    X_pca = pca.transform(X_scaled)
+    X_cluster      = _prepare_features_for_clustering(feature_table)
+    X_imputed      = imputer.transform(X_cluster)
+    X_scaled       = scaler.transform(X_imputed)
+    X_pca          = pca.transform(X_scaled)
     cluster_labels = kmeans.predict(X_pca)
 
-    # 3) Add 'cluster' back to feature_table copy
     ft_with_cluster = feature_table.copy()
     ft_with_cluster["cluster"] = cluster_labels.astype(int)
 
-    # 4) Ensure all model feature columns exist (for XGBoost models)
     for col in model_feature_columns:
         if col not in ft_with_cluster.columns:
             ft_with_cluster[col] = np.nan
 
-    # 5) Reorder into exact feature order for models
     X_ready = ft_with_cluster[model_feature_columns].copy()
 
     return ft_with_cluster, X_ready
