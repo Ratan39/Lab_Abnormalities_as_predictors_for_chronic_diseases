@@ -181,58 +181,33 @@ def build_feature_table_for_bundle(
 # -----------------------------------------------------------
 
 def build_lab_features_from_obs(df_obs: pd.DataFrame) -> pd.DataFrame:
-    """
-    Take the observation DataFrame (as returned by parse_patient_bundle),
-    and produce a wide table:
+    if df_obs is None or df_obs.empty:
+        return pd.DataFrame()
 
-        patient_id, glucose_latest, hba1c_latest, creatinine_latest, ...
+    # FORCE conversion immediately. Don't even check the type.
+    # Coercing errors to NaT prevents the issubdtype crash.
+    df_obs = df_obs.copy()
+    df_obs["effective_datetime"] = pd.to_datetime(df_obs["effective_datetime"], errors="coerce")
 
-    Using the *latest* available value per lab per patient.
-    """
-
-    required_cols = {"patient_id", "code_display", "value_quantity", "effective_datetime"}
-    missing = required_cols - set(df_obs.columns)
-    if missing:
-        raise ValueError(f"df_obs is missing required columns: {missing}")
-
-    # Keep only labs we care about
+    # Now filter
     obs = df_obs[df_obs["code_display"].isin(LAB_MAPPING.keys())].copy()
     if obs.empty:
-        # No matching labs; return an empty frame with just patient_id (if present)
-        # We'll handle missing labs later in the pipeline.
         return pd.DataFrame(columns=["patient_id"])
 
-    # Map to unified feature names
     obs["feature_name"] = obs["code_display"].map(LAB_MAPPING)
 
-    # Convert date
-    if not np.issubdtype(obs["effective_datetime"].dtype, np.datetime64):
-        obs["effective_datetime"] = pd.to_datetime(obs["effective_datetime"], errors="coerce")
+    # Sort and Drop (This is where your traceback says it crashes)
+    obs = obs.sort_values(["patient_id", "feature_name", "effective_datetime"], ascending=[True, True, False])
+    
+    # This call to drop_duplicates will now succeed because the dtype is forced
+    obs_latest = obs.drop_duplicates(subset=["patient_id", "feature_name"], keep="first")
 
-    # Sort by most recent
-    obs = obs.sort_values(
-        ["patient_id", "feature_name", "effective_datetime"],
-        ascending=[True, True, False]
-    )
-
-    # Keep only the latest per patient + feature
-    obs_latest = obs.drop_duplicates(
-        subset=["patient_id", "feature_name"],
-        keep="first"
-    )
-
-    # Pivot to wide format
     lab_features = obs_latest.pivot_table(
         index="patient_id",
         columns="feature_name",
         values="value_quantity",
         aggfunc="first"
     ).reset_index()
-
-    # Ensure numeric labs
-    for col in lab_features.columns:
-        if col != "patient_id":
-            lab_features[col] = pd.to_numeric(lab_features[col], errors="coerce")
 
     return lab_features
 
