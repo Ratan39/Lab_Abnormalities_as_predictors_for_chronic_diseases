@@ -277,7 +277,7 @@ def get_height_weight(df_obs: pd.DataFrame) -> (Optional[float], Optional[float]
     ):
         df_obs = df_obs.copy()
         df_obs["effective_datetime"] = pd.to_datetime(
-            df_obs["effective_datetime"], errors="coerce"
+             df_obs["effective_datetime"], errors="coerce", utc=True
         )
 
     # Height
@@ -414,7 +414,7 @@ if page == "Upload":
 
             # Load sample directly into the app
             with col_load:
-                if st.button("Load sample into app", use_container_width=True):
+                if st.button("Load sample into app", width="stretch"):
                     try:
                         with open(selected_file, "r") as f:
                             bundle_json = json.load(f)
@@ -436,7 +436,7 @@ if page == "Upload":
                         data=sample_content,
                         file_name=selected_file.name,
                         mime="application/json",
-                        use_container_width=True,
+                        width="stretch",
                     )
                 except Exception:
                     st.write("")
@@ -585,7 +585,7 @@ if page == "Report Analysis":
     if not lab_summary_df.empty:
         # Show user-friendly subset of columns
         show_df = lab_summary_df[["Lab", "Your result", "Reference range", "Status"]].copy()
-        st.dataframe(show_df, use_container_width=True)
+        st.dataframe(show_df, width="stretch")
     else:
         st.write("No mapped lab values found in this file.")
 
@@ -690,8 +690,10 @@ if page == "Report Analysis":
         else:
             # Ensure datetime
             if not pd.api.types.is_datetime64_any_dtype(df_obs_num["effective_datetime"]):
-                df_obs_num["effective_datetime"] = pd.to_datetime(
-                    df_obs_num["effective_datetime"], errors="coerce"
+                if "effective_datetime" in df_obs.columns:
+                    df_obs = df_obs.copy()
+                    df_obs["effective_datetime"] = pd.to_datetime(
+                    df_obs["effective_datetime"], errors="coerce", utc=True
                 )
 
             # Build choices *based on what this patient actually has*
