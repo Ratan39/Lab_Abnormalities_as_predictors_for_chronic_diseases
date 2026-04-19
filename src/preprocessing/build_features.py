@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Dict
+import math
 import pandas as pd
 
 # -----------------------------------------------------------
@@ -39,6 +40,26 @@ LAB_MAPPING: Dict[str, str] = {
 }
 
 # -----------------------------------------------------------
+# helpers
+# -----------------------------------------------------------
+
+def _to_py_str(v) -> str:
+    """Unconditionally produce a native Python str — works on numpy.str_, bytes, anything."""
+    return str.__new__(str, v) if type(v) is str else str(v)
+
+def _to_py_float(v) -> float:
+    """Unconditionally produce a native Python float (or math.nan for missing)."""
+    if v is None:
+        return math.nan
+    t = type(v)
+    if t is float:
+        return v
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return math.nan
+
+# -----------------------------------------------------------
 # 1. Build lab features from df_obs
 # -----------------------------------------------------------
 
@@ -46,14 +67,14 @@ def build_lab_features_from_obs(df_obs: pd.DataFrame) -> pd.DataFrame:
     """
     Produces a wide (one-row-per-patient) table of latest lab values.
 
-    NumPy 2.x / Python 3.13 issue: numpy.issubdtype() is triggered by ANY
-    operation that hashes or compares NumPy scalar types (numpy.str_,
-    numpy.float64, etc.) — including set membership, dict lookup, and all
-    reshape ops (pivot, pivot_table, unstack).
+    NumPy 2.x / Python 3.13: numpy.issubdtype() is triggered by ANY
+    operation that hashes, compares, or introspects a NumPy scalar —
+    including dict/set lookups and even type() checks in some builds.
 
-    Fix: extract only the three needed columns as plain Python lists via
-    .tolist() BEFORE any looping or collection operations, so every value
-    is a native Python str/float/None and NumPy scalars never appear.
+    The only safe approach: cast every value to a *native* Python type
+    via str() / float() (not .tolist(), which can still return NumPy
+    scalars in certain pandas/NumPy version combos) before touching
+    any Python collection.
     """
     if df_obs is None or df_obs.empty:
         return pd.DataFrame()
@@ -63,7 +84,7 @@ def build_lab_features_from_obs(df_obs: pd.DataFrame) -> pd.DataFrame:
     if obs.empty:
         return pd.DataFrame(columns=["patient_id"])
 
-    # -- type-safe conversions ------------------------------------------------
+    # -- type-safe conversions on the filtered copy ---------------------------
     if "effective_datetime" in obs.columns:
         obs["effective_datetime"] = pd.to_datetime(
             obs["effective_datetime"], errors="coerce"
@@ -78,27 +99,31 @@ def build_lab_features_from_obs(df_obs: pd.DataFrame) -> pd.DataFrame:
         na_position="last",
     )
 
-    # -- extract as plain Python lists (kills ALL NumPy scalar types) ---------
-    # .tolist() on a pandas Series converts every element to a native Python
-    # type: numpy.str_ -> str, numpy.float64 -> float, NaT -> None, etc.
-    # After this point there are zero NumPy objects in play.
-    patient_ids   = obs["patient_id"].tolist()      # list[str]
-    feature_names = obs["feature_name"].tolist()    # list[str]
-    values        = obs["value_quantity"].tolist()  # list[float | None]
+    # -- build wide dict using only native Python scalars ---------------------
+    # We iterate over the raw values arrays directly (avoiding itertuples /
+    # iterrows which still box values as NumPy scalars), then EXPLICITLY cast
+    # each element to str / float so no NumPy type ever enters a Python
+    # collection or comparison.
+    pid_arr  = obs["patient_id"].values
+    feat_arr = obs["feature_name"].values
+    val_arr  = obs["value_quantity"].values
 
-    # -- build wide dict with plain Python types only -------------------------
-    wide: dict[str, dict[str, float]] = {}
-    seen: set[tuple[str, str]] = set()
+    wide: dict = {}   # { str -> { str -> float } }
+    seen: set  = set()
 
-    for pid, feat, val in zip(patient_ids, feature_names, values):
-        # pid and feat are now guaranteed native Python str — safe to hash
-        key = (pid, feat)
+    for i in range(len(pid_arr)):
+        pid  = _to_py_str(pid_arr[i])    # guaranteed native Python str
+        feat = _to_py_str(feat_arr[i])   # guaranteed native Python str
+        val  = _to_py_float(val_arr[i])  # guaranteed native Python float
+
+        key = pid + "\x00" + feat        # string concat — no tuple hashing
         if key in seen:
             continue
         seen.add(key)
+
         if pid not in wide:
             wide[pid] = {}
-        wide[pid][feat] = val   # val is native Python float or None
+        wide[pid][feat] = val
 
     if not wide:
         return pd.DataFrame(columns=["patient_id"])
@@ -108,97 +133,6 @@ def build_lab_features_from_obs(df_obs: pd.DataFrame) -> pd.DataFrame:
     lab_features.index.name = "patient_id"
     lab_features = lab_features.reset_index()
 
-    # Ensure lab columns are float64
-    for col in lab_features.columns:
-        if col != "patient_id":
-            lab_features[col] = pd.to_numeric(lab_features[col], errors="coerce")
-
-    return lab_features
-
-
-# -----------------------------------------------------------
-# 2. Build demographics from df_patients
-# -----------------------------------------------------------
-
-def build_demographics_from_patients(
-    df_patients: pd.DataFrame,
-    reference_date: str = "2025-01-01",
-) -> pd.DataFrame:
-    required_cols = {"patient_id", "gender", "birth_date"}
-    if not required_cols.issubset(df_patients.columns):
-        return pd.DataFrame(columns=["patient_id", "age", "sex"])
-
-    patients = df_patients.copy()
-    patients["birth_date"] = pd.to_datetime(patients["birth_date"], errors="coerce")
-    ref_date = pd.to_datetime(reference_date)
-
-    patients["age"] = (ref_date - patients["birth_date"]).dt.days // 365
-
-    sex_map = {"M": 1.0, "F": 0.0}
-    patients["sex"] = (
-        patients["gender"].str[:1].str.upper().map(sex_map).fillna(0.0).astype("float32")
-    )
-
-    return patients[["patient_id", "age", "sex"]]
-
-
-# -----------------------------------------------------------
-# 3. Main Orchestrator for Streamlit
-# -----------------------------------------------------------
-
-def build_feature_table_for_bundle(
-    df_patients: pd.DataFrame,
-    df_obs: pd.DataFrame,
-    reference_date: str = "2025-01-01",
-) -> pd.DataFrame:
-    """Main entry point for the Streamlit app."""
-    demo = build_demographics_from_patients(df_patients, reference_date=reference_date)
-    labs = build_lab_features_from_obs(df_obs)
-
-    if labs.empty:
-        return demo.copy()
-
-    feature_table = demo.merge(labs, on="patient_id", how="left")
-    return feature_table
-        obs["effective_datetime"] = pd.to_datetime(
-            obs["effective_datetime"], errors="coerce"
-        )
-    obs["value_quantity"] = pd.to_numeric(obs["value_quantity"], errors="coerce")
-    obs["feature_name"]   = obs["code_display"].map(LAB_MAPPING)
-
-    # -- sort so the most-recent row comes first per (patient, feature) -------
-    obs = obs.sort_values(
-        ["patient_id", "feature_name", "effective_datetime"],
-        ascending=[True, True, False],
-        na_position="last",
-    )
-
-    # -- build wide table via pure-Python dict — no NumPy reshape at all ------
-    # { patient_id: { feature_name: value, ... }, ... }
-    wide: dict[str, dict[str, float]] = {}
-    seen: set[tuple] = set()
-
-    for row in obs.itertuples(index=False):
-        pid     = row.patient_id
-        feat    = row.feature_name
-        val     = row.value_quantity          # already float / NaN
-        key     = (pid, feat)
-        if key in seen:
-            continue                          # keep first (= most recent)
-        seen.add(key)
-        if pid not in wide:
-            wide[pid] = {}
-        wide[pid][feat] = val
-
-    if not wide:
-        return pd.DataFrame(columns=["patient_id"])
-
-    # -- assemble DataFrame from the dict directly ----------------------------
-    lab_features = pd.DataFrame.from_dict(wide, orient="index")
-    lab_features.index.name = "patient_id"
-    lab_features = lab_features.reset_index()
-
-    # Guarantee all lab columns are float64 (not object)
     for col in lab_features.columns:
         if col != "patient_id":
             lab_features[col] = pd.to_numeric(lab_features[col], errors="coerce")
