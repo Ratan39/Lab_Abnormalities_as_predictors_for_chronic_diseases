@@ -102,8 +102,8 @@ def build_lab_features_table() -> pd.DataFrame:
     obs["feature_name"] = obs["code_display"].map(LAB_MAPPING)
 
     # Convert date
-    if not np.issubdtype(obs["effective_datetime"].dtype, np.datetime64):
-        obs["effective_datetime"] = pd.to_datetime(obs["effective_datetime"])
+    if not pd.api.types.is_datetime64_any_dtype(obs["effective_datetime"]):
+        obs["effective_datetime"] = pd.to_datetime(obs["effective_datetime"], errors='coerce')
 
     # Sort by most recent
     obs = obs.sort_values(
