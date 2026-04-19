@@ -271,14 +271,15 @@ def get_height_weight(df_obs: pd.DataFrame) -> (Optional[float], Optional[float]
     if df_obs.empty:
         return height_val, weight_val
 
-    # Make sure effective_datetime is datetime for sorting
-    if "effective_datetime" in df_obs.columns and not pd.api.types.is_datetime64_any_dtype(
-        df_obs["effective_datetime"]
-    ):
+    is_dt = pd.api.types.is_datetime64_any_dtype(df_obs["effective_datetime"])
+    
+    if "effective_datetime" in df_obs.columns and not is_dt:
         df_obs = df_obs.copy()
         df_obs["effective_datetime"] = pd.to_datetime(
             df_obs["effective_datetime"], errors="coerce"
         )
+
+    # ... rest of your height/weight logic remains the same
 
     # Height
     df_h = df_obs[df_obs["code_display"].isin(HEIGHT_NAMES)].copy()
