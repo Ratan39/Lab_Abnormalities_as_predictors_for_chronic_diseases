@@ -59,50 +59,45 @@ LAB_MAPPING: Dict[str, str] = {
 
 def build_lab_features_from_obs(df_obs: pd.DataFrame) -> pd.DataFrame:
     """
-    Take the observation DataFrame and produce a wide table.
-    FIXED: Uses pd.api.types to avoid Python 3.13 NumPy TypeError.
+    Produces a wide table of lab results. 
+    Forced datetime conversion at the start prevents the NumPy 2.x/Python 3.13 crash.
     """
-    required_cols = {"patient_id", "code_display", "value_quantity", "effective_datetime"}
-    missing = required_cols - set(df_obs.columns)
-    if missing:
-        raise ValueError(f"df_obs is missing required columns: {missing}")
+    if df_obs is None or df_obs.empty:
+        return pd.DataFrame()
 
-    # Keep only labs we care about
+    # 1. FORCE THE TYPE IMMEDIATELY
+    # This prevents drop_duplicates from calling the buggy NumPy check later.
+    df_obs = df_obs.copy()
+    if "effective_datetime" in df_obs.columns:
+        df_obs["effective_datetime"] = pd.to_datetime(df_obs["effective_datetime"], errors="coerce")
+    
+    # 2. FILTER
     obs = df_obs[df_obs["code_display"].isin(LAB_MAPPING.keys())].copy()
     if obs.empty:
         return pd.DataFrame(columns=["patient_id"])
 
-    # Map to unified feature names
+    # 3. MAP
     obs["feature_name"] = obs["code_display"].map(LAB_MAPPING)
 
-    # ✅ FIXED LINE: Robust datetime check for Python 3.13
-    if not pd.api.types.is_datetime64_any_dtype(obs["effective_datetime"]):
-        obs["effective_datetime"] = pd.to_datetime(obs["effective_datetime"], errors="coerce")
-
-    # Sort by most recent
+    # 4. SORT AND DROP DUPLICATES
+    # Because we forced the type in Step 1, this line will no longer crash.
     obs = obs.sort_values(
         ["patient_id", "feature_name", "effective_datetime"],
         ascending=[True, True, False]
     )
 
-    # Keep only the latest per patient + feature
     obs_latest = obs.drop_duplicates(
         subset=["patient_id", "feature_name"],
         keep="first"
     )
 
-    # Pivot to wide format
+    # 5. PIVOT
     lab_features = obs_latest.pivot_table(
         index="patient_id",
         columns="feature_name",
         values="value_quantity",
         aggfunc="first"
     ).reset_index()
-
-    # Ensure numeric labs
-    for col in lab_features.columns:
-        if col != "patient_id":
-            lab_features[col] = pd.to_numeric(lab_features[col], errors="coerce")
 
     return lab_features
 
