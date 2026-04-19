@@ -1,6 +1,5 @@
 from __future__ import annotations
-from typing import Dict, Any
-import numpy as np
+from typing import Dict
 import pandas as pd
 
 # -----------------------------------------------------------
@@ -45,58 +44,67 @@ LAB_MAPPING: Dict[str, str] = {
 
 def build_lab_features_from_obs(df_obs: pd.DataFrame) -> pd.DataFrame:
     """
-    Produces a wide table of lab results.
+    Produces a wide (one-row-per-patient) table of latest lab values.
 
-    NumPy 2.x / Python 3.13 compatibility notes
-    --------------------------------------------
-    * pivot_table() calls numpy.issubdtype() internally and crashes when any
-      column still carries object dtype.  We use plain pivot() instead, which
-      skips that code path entirely.
-    * Datetime conversion must happen on the filtered `obs` copy (not the
-      original df_obs) because a boolean-slice + .copy() can re-materialise
-      the original object dtype on some pandas/NumPy combos.
+    Completely avoids pivot(), pivot_table(), and unstack() because all
+    three ultimately call numpy.issubdtype() internally, which crashes on
+    NumPy 2.x / Python 3.13 when columns carry object dtype.
+
+    Instead we build the wide table with a plain Python dict accumulator
+    and construct the DataFrame directly from that — zero NumPy reshape ops.
     """
     if df_obs is None or df_obs.empty:
         return pd.DataFrame()
 
-    # STEP 1: filter to only the lab codes we care about
+    # -- filter ---------------------------------------------------------------
     obs = df_obs[df_obs["code_display"].isin(LAB_MAPPING.keys())].copy()
     if obs.empty:
         return pd.DataFrame(columns=["patient_id"])
 
-    # STEP 2: force datetime dtype on the filtered copy
+    # -- type-safe conversions (must be done on this copy, not the original) --
     if "effective_datetime" in obs.columns:
         obs["effective_datetime"] = pd.to_datetime(
             obs["effective_datetime"], errors="coerce"
         )
-
-    # STEP 3: map display name -> feature column name
-    obs["feature_name"] = obs["code_display"].map(LAB_MAPPING)
-
-    # STEP 4: coerce value to numeric BEFORE pivoting
-    # Ensures the pivot column is float64, never object, sidestepping
-    # any remaining issubdtype probes inside pandas/NumPy internals.
     obs["value_quantity"] = pd.to_numeric(obs["value_quantity"], errors="coerce")
+    obs["feature_name"]   = obs["code_display"].map(LAB_MAPPING)
 
-    # STEP 5: keep only the most-recent row per (patient, feature)
+    # -- sort so the most-recent row comes first per (patient, feature) -------
     obs = obs.sort_values(
         ["patient_id", "feature_name", "effective_datetime"],
         ascending=[True, True, False],
         na_position="last",
     )
-    obs_latest = obs.drop_duplicates(subset=["patient_id", "feature_name"], keep="first")
 
-    # STEP 6: pivot with plain pivot() — avoids pivot_table's aggfunc/issubdtype path
-    # drop_duplicates above guarantees at most one value per (patient, feature),
-    # so no aggregation is needed and pivot() is safe.
-    lab_features = (
-        obs_latest[["patient_id", "feature_name", "value_quantity"]]
-        .pivot(index="patient_id", columns="feature_name", values="value_quantity")
-        .reset_index()
-    )
+    # -- build wide table via pure-Python dict — no NumPy reshape at all ------
+    # { patient_id: { feature_name: value, ... }, ... }
+    wide: dict[str, dict[str, float]] = {}
+    seen: set[tuple] = set()
 
-    # Clean up the column index name added by pivot
-    lab_features.columns.name = None
+    for row in obs.itertuples(index=False):
+        pid     = row.patient_id
+        feat    = row.feature_name
+        val     = row.value_quantity          # already float / NaN
+        key     = (pid, feat)
+        if key in seen:
+            continue                          # keep first (= most recent)
+        seen.add(key)
+        if pid not in wide:
+            wide[pid] = {}
+        wide[pid][feat] = val
+
+    if not wide:
+        return pd.DataFrame(columns=["patient_id"])
+
+    # -- assemble DataFrame from the dict directly ----------------------------
+    lab_features = pd.DataFrame.from_dict(wide, orient="index")
+    lab_features.index.name = "patient_id"
+    lab_features = lab_features.reset_index()
+
+    # Guarantee all lab columns are float64 (not object)
+    for col in lab_features.columns:
+        if col != "patient_id":
+            lab_features[col] = pd.to_numeric(lab_features[col], errors="coerce")
 
     return lab_features
 
