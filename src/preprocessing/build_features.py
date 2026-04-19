@@ -46,57 +46,60 @@ LAB_MAPPING: Dict[str, str] = {
 def build_lab_features_from_obs(df_obs: pd.DataFrame) -> pd.DataFrame:
     """
     Produces a wide table of lab results.
-    Datetime conversion is applied to the filtered `obs` copy (not the
-    original df_obs) so the dtype is guaranteed to be datetime64 when
-    sort_values / drop_duplicates run — preventing the NumPy 2.x
-    'issubdtype(object, datetime64)' crash on Python 3.13.
+
+    NumPy 2.x / Python 3.13 compatibility notes
+    --------------------------------------------
+    * pivot_table() calls numpy.issubdtype() internally and crashes when any
+      column still carries object dtype.  We use plain pivot() instead, which
+      skips that code path entirely.
+    * Datetime conversion must happen on the filtered `obs` copy (not the
+      original df_obs) because a boolean-slice + .copy() can re-materialise
+      the original object dtype on some pandas/NumPy combos.
     """
     if df_obs is None or df_obs.empty:
         return pd.DataFrame()
 
-    # ✅ STEP 1: FILTER FIRST — work on a fresh copy of only the rows we need
+    # STEP 1: filter to only the lab codes we care about
     obs = df_obs[df_obs["code_display"].isin(LAB_MAPPING.keys())].copy()
     if obs.empty:
         return pd.DataFrame(columns=["patient_id"])
 
-    # ✅ STEP 2: FORCE DATETIME CONVERSION ON THE FILTERED COPY
-    # Converting on df_obs is not enough: the slice above can carry over
-    # the original object dtype on some pandas/NumPy version combos.
-    # Converting here ensures sort_values sees a true datetime64 column.
+    # STEP 2: force datetime dtype on the filtered copy
     if "effective_datetime" in obs.columns:
-        obs["effective_datetime"] = pd.to_datetime(obs["effective_datetime"], errors="coerce")
+        obs["effective_datetime"] = pd.to_datetime(
+            obs["effective_datetime"], errors="coerce"
+        )
 
-    # ✅ STEP 3: MAP
+    # STEP 3: map display name -> feature column name
     obs["feature_name"] = obs["code_display"].map(LAB_MAPPING)
 
-    # ✅ STEP 4: SORT AND DROP DUPLICATES
-    # na_position="last" keeps NaT dates from floating above real timestamps,
-    # so keep="first" always retains the most recent valid observation.
+    # STEP 4: coerce value to numeric BEFORE pivoting
+    # Ensures the pivot column is float64, never object, sidestepping
+    # any remaining issubdtype probes inside pandas/NumPy internals.
+    obs["value_quantity"] = pd.to_numeric(obs["value_quantity"], errors="coerce")
+
+    # STEP 5: keep only the most-recent row per (patient, feature)
     obs = obs.sort_values(
         ["patient_id", "feature_name", "effective_datetime"],
         ascending=[True, True, False],
         na_position="last",
     )
+    obs_latest = obs.drop_duplicates(subset=["patient_id", "feature_name"], keep="first")
 
-    obs_latest = obs.drop_duplicates(
-        subset=["patient_id", "feature_name"],
-        keep="first"
+    # STEP 6: pivot with plain pivot() — avoids pivot_table's aggfunc/issubdtype path
+    # drop_duplicates above guarantees at most one value per (patient, feature),
+    # so no aggregation is needed and pivot() is safe.
+    lab_features = (
+        obs_latest[["patient_id", "feature_name", "value_quantity"]]
+        .pivot(index="patient_id", columns="feature_name", values="value_quantity")
+        .reset_index()
     )
 
-    # ✅ STEP 5: PIVOT
-    lab_features = obs_latest.pivot_table(
-        index="patient_id",
-        columns="feature_name",
-        values="value_quantity",
-        aggfunc="first"
-    ).reset_index()
-
-    # Ensure all lab columns are numeric
-    for col in lab_features.columns:
-        if col != "patient_id":
-            lab_features[col] = pd.to_numeric(lab_features[col], errors="coerce")
+    # Clean up the column index name added by pivot
+    lab_features.columns.name = None
 
     return lab_features
+
 
 # -----------------------------------------------------------
 # 2. Build demographics from df_patients
@@ -104,7 +107,7 @@ def build_lab_features_from_obs(df_obs: pd.DataFrame) -> pd.DataFrame:
 
 def build_demographics_from_patients(
     df_patients: pd.DataFrame,
-    reference_date: str = "2025-01-01"
+    reference_date: str = "2025-01-01",
 ) -> pd.DataFrame:
     required_cols = {"patient_id", "gender", "birth_date"}
     if not required_cols.issubset(df_patients.columns):
@@ -114,14 +117,15 @@ def build_demographics_from_patients(
     patients["birth_date"] = pd.to_datetime(patients["birth_date"], errors="coerce")
     ref_date = pd.to_datetime(reference_date)
 
-    # Compute age
     patients["age"] = (ref_date - patients["birth_date"]).dt.days // 365
 
-    # Map sex to numeric (1=M, 0=F)
     sex_map = {"M": 1.0, "F": 0.0}
-    patients["sex"] = patients["gender"].str[:1].str.upper().map(sex_map).fillna(0.0).astype("float32")
+    patients["sex"] = (
+        patients["gender"].str[:1].str.upper().map(sex_map).fillna(0.0).astype("float32")
+    )
 
     return patients[["patient_id", "age", "sex"]]
+
 
 # -----------------------------------------------------------
 # 3. Main Orchestrator for Streamlit
@@ -130,122 +134,14 @@ def build_demographics_from_patients(
 def build_feature_table_for_bundle(
     df_patients: pd.DataFrame,
     df_obs: pd.DataFrame,
-    reference_date: str = "2025-01-01"
+    reference_date: str = "2025-01-01",
 ) -> pd.DataFrame:
-    """
-    Main entry point for the Streamlit app.
-    """
+    """Main entry point for the Streamlit app."""
     demo = build_demographics_from_patients(df_patients, reference_date=reference_date)
     labs = build_lab_features_from_obs(df_obs)
 
     if labs.empty:
         return demo.copy()
 
-    # Final merge
-    feature_table = demo.merge(labs, on="patient_id", how="left")
-    return feature_table    "Albumin [Mass/volume] in Serum or Plasma": "albumin_latest",
-    "Albumin": "albumin_latest",
-    "Protein [Mass/volume] in Serum or Plasma": "protein_latest",
-}
-
-# -----------------------------------------------------------
-# 1. Build lab features from df_obs
-# -----------------------------------------------------------
-
-def build_lab_features_from_obs(df_obs: pd.DataFrame) -> pd.DataFrame:
-    """
-    Produces a wide table of lab results. 
-    Forced datetime conversion at the start prevents the NumPy 2.x/Python 3.13 crash.
-    """
-    if df_obs is None or df_obs.empty:
-        return pd.DataFrame()
-
-    # Create a local copy to avoid SettingWithCopy warnings
-    df_obs = df_obs.copy()
-
-    # ✅ STEP 1: FORCE CONVERSION IMMEDIATELY
-    # This prevents the NumPy 'issubdtype' crash during drop_duplicates
-    if "effective_datetime" in df_obs.columns:
-        df_obs["effective_datetime"] = pd.to_datetime(df_obs["effective_datetime"], errors="coerce")
-    
-    # ✅ STEP 2: FILTER
-    obs = df_obs[df_obs["code_display"].isin(LAB_MAPPING.keys())].copy()
-    if obs.empty:
-        return pd.DataFrame(columns=["patient_id"])
-
-    # ✅ STEP 3: MAP
-    obs["feature_name"] = obs["code_display"].map(LAB_MAPPING)
-
-    # ✅ STEP 4: SORT AND DROP DUPLICATES
-    # The sort and drop will now work because 'effective_datetime' is a proper datetime64 type
-    obs = obs.sort_values(
-        ["patient_id", "feature_name", "effective_datetime"],
-        ascending=[True, True, False]
-    )
-
-    obs_latest = obs.drop_duplicates(
-        subset=["patient_id", "feature_name"],
-        keep="first"
-    )
-
-    # ✅ STEP 5: PIVOT
-    lab_features = obs_latest.pivot_table(
-        index="patient_id",
-        columns="feature_name",
-        values="value_quantity",
-        aggfunc="first"
-    ).reset_index()
-
-    # Ensure all lab columns are numeric
-    for col in lab_features.columns:
-        if col != "patient_id":
-            lab_features[col] = pd.to_numeric(lab_features[col], errors="coerce")
-
-    return lab_features
-
-# -----------------------------------------------------------
-# 2. Build demographics from df_patients
-# -----------------------------------------------------------
-
-def build_demographics_from_patients(
-    df_patients: pd.DataFrame,
-    reference_date: str = "2025-01-01"
-) -> pd.DataFrame:
-    required_cols = {"patient_id", "gender", "birth_date"}
-    if not required_cols.issubset(df_patients.columns):
-        return pd.DataFrame(columns=["patient_id", "age", "sex"])
-
-    patients = df_patients.copy()
-    patients["birth_date"] = pd.to_datetime(patients["birth_date"], errors="coerce")
-    ref_date = pd.to_datetime(reference_date)
-
-    # Compute age
-    patients["age"] = (ref_date - patients["birth_date"]).dt.days // 365
-
-    # Map sex to numeric (1=M, 0=F)
-    sex_map = {"M": 1.0, "F": 0.0}
-    patients["sex"] = patients["gender"].str[:1].str.upper().map(sex_map).fillna(0.0).astype("float32")
-
-    return patients[["patient_id", "age", "sex"]]
-
-# -----------------------------------------------------------
-# 3. Main Orchestrator for Streamlit
-# -----------------------------------------------------------
-
-def build_feature_table_for_bundle(
-    df_patients: pd.DataFrame,
-    df_obs: pd.DataFrame,
-    reference_date: str = "2025-01-01"
-) -> pd.DataFrame:
-    """
-    Main entry point for the Streamlit app.
-    """
-    demo = build_demographics_from_patients(df_patients, reference_date=reference_date)
-    labs = build_lab_features_from_obs(df_obs)
-
-    if labs.empty:
-        return demo.copy()
-    
-    # Final merge
     feature_table = demo.merge(labs, on="patient_id", how="left")
     return feature_table
